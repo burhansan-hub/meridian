@@ -565,7 +565,9 @@ function profileSection(q,s,pl,h){
       +'<span class="w-credits-note">'+esc(credits.serving?'serving on credits':credits.policy||credits.note)+'</span></div>'
       +(credits.pace?'<div class="usage-row credits-row" title="'+esc(credits.pace.title)+'"><span class="w-label">lasts</span>'
         +'<span class="w-credits-note credits-pace">'+esc(credits.pace.text)+'</span></div>':'');
-    var isPriority=pl&&pl.routing==='priority';
+    // balanced is a pool like priority: routing, not a click, picks the account.
+    var isBalanced=pl&&pl.routing==='balanced';
+    var isPriority=pl&&(pl.routing==='priority'||isBalanced);
     // active+priority keeps the active profile meaningful - switching it is how
     // you move traffic, so the card stays clickable, unlike in pure priority.
     var isActivePriority=pl&&pl.routing==='active+priority';
@@ -584,7 +586,8 @@ function profileSection(q,s,pl,h){
       // its place is a fallback one in either mode.
       var poolOrder=(pl.profileOrder||[]).filter(function(id){return !!entryById[id]&&isChatGptProfile(entryById[id])===chat});
       var orderIdx=poolOrder.indexOf(p.id);
-      if(orderIdx>=0)badge+='<span class="pool-chip">'+(isActivePriority||chat?'#'+(orderIdx+1)+' fallback':'#'+(orderIdx+1)+' in pool')+'</span>';
+      if(isBalanced&&!chat)badge+='<span class="pool-chip" title="Pool requests running on this account">'+((pl.inFlight||{})[p.id]||0)+' in flight</span>';
+      else if(orderIdx>=0)badge+='<span class="pool-chip">'+(isActivePriority||chat?'#'+(orderIdx+1)+' fallback':'#'+(orderIdx+1)+' in pool')+'</span>';
       var exh=(pl.exhausted||[]).filter(function(e){return e.id===p.id})[0];
       // Suppressed when a refusal is being reported below: both say the same
       // thing, and the banner says it better.

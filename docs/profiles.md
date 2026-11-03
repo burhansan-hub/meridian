@@ -258,6 +258,45 @@ MERIDIAN_ROUTING=priority MERIDIAN_PROFILE_ORDER=work,personal meridian
   The reserve is approximate. It reads only usage Meridian has already observed (the SDK's rate-limit events and any cached usage reads) and never makes extra usage requests, so it can land a few percent past the line, and an account Meridian has not measured yet is not held. Right after a restart that means no protection until a usage read succeeds (the dashboard and desktop app read usage while open, and the usage endpoint rate-limits), or until the SDK reports weekly usage on a response. A conversation already on the account moves to the next account on its next turn. Internal work that may only resume its existing route (for example a title or compaction request) keeps it. Cache-keepalive pings skip a held account. When every account in the pool is holding its reserve, Meridian answers `429` with a `Retry-After` for the earliest weekly reset (capped at 24 hours). Explicit `x-meridian-profile` pins and the `active`/`sticky` modes are not affected. Changes are logged as `priority.weekly_reserve_held` and `priority.weekly_reserve_released`; a value outside 1–99 or a profile name that doesn't exist is logged (`priority.weekly_reserve_invalid`, `priority.weekly_reserve_unknown_ids`) and ignored.
 - Failovers are logged (`profile.failover` in the diagnostic stream; `profile=<id>(priority)` in request lines).
 
+### Balanced routing
+
+**Opt-in.** `routing = "balanced"` spreads work over the pool instead of draining it in order:
+
+```bash
+MERIDIAN_ROUTING=balanced meridian     # or "routing": "balanced" in settings.json, or /settings
+```
+
+- A **new conversation** goes to the account with the fewest pool requests in flight. Ties go to the account with the lower measured usage (the higher of its current five-hour and weekly utilization, from what Meridian has already observed; an unmeasured account counts as unused), then to the one idle longest, then to the configured profile order.
+- Everything else is the [priority](#priority-failover-routing) machinery: a conversation **stays on its account** while that account is healthy (prompt caching is per account), a quota or billing refusal before any output fails over to the next account and benches the refusing one until its reset, the weekly reserve applies, and an explicit `x-meridian-profile` bypasses the pool. There is no failback: no account is preferred, so there is nothing to fail back to.
+- A request counts against one account at a time: when it fails over, it stops counting against the account that refused it. Counts are per process and start at zero after a restart.
+- The home page shows `n in flight` per account; `GET /profiles/list` reports the same counts as `inFlight`.
+
+### Disabling a profile
+
+Take an account out of service without losing its sign-in: **Disable** on its card on `/profiles`, `meridian profile disable <name>`, or `POST /profiles/disable` with `{"profile":"work","disabled":true}`. **Enable** (or `"disabled":false`) puts it back with no new sign-in.
+
+- Requests already running on it finish. No new request is routed to it: every pool mode leaves it out, and the active/default fallback skips it.
+- A request that names it in `x-meridian-profile` is refused with `403` (`code: "profile_disabled"`) rather than served by another account. With every profile disabled, unpinned requests get `503` (`no_enabled_profile`).
+- Re-login, renewal and listing still act on it, so an expired account can be repaired before it is enabled.
+- The flag is `"disabled": true` on the profile's entry in `profiles.json`, so it survives restarts and is shared by every instance reading that file. A cooldown, unlike it, is in memory only.
+- ChatGPT seats are not affected; they keep their own controls.
+
+### Removing a profile
+
+The bin on a profile's card on `/profiles` (or `POST /profiles/remove` with `{"profile":"work"}`, or `meridian profile remove <name>`) removes the profile and the credential directory Meridian created for it; a directory outside Meridian's `profiles/` folder is left alone. When the removed profile was active, the active pointer moves to the first remaining enabled profile. Disable it instead to keep the sign-in.
+
+### Requiring an explicit profile
+
+`MERIDIAN_REQUIRE_PROFILE=1` is for an instance several tenants share, where serving one tenant's request from another's account is worse than refusing it. Every model request (`/v1/messages`, the OpenAI-compatible routes, `/v1/models`, `/v1/design/*`) must then name a registered profile in `x-meridian-profile`:
+
+| Request | Answer |
+|---|---|
+| no `x-meridian-profile` | `400`, `code: "profile_required"` — the pool is never consulted |
+| a name that is not a profile or alias | `404`, `code: "unknown_profile"` — never the first profile |
+| a disabled profile | `403`, `code: "profile_disabled"` |
+
+The registry is re-read for each such request, so a profile removed or disabled by another process is refused at once.
+
 ### Profile commands
 
 | Command | Description |
@@ -268,6 +307,8 @@ MERIDIAN_ROUTING=priority MERIDIAN_PROFILE_ORDER=work,personal meridian
 | `meridian profile switch <name>` | Switch the active profile (requires running proxy) |
 | `meridian profile login <name> [--headless]` | Re-authenticate an expired profile, adding it first if that name has no profile yet (browser-login profiles only); `--headless` uses the URL/code flow |
 | `meridian profile remove <name>` | Remove a profile and its credentials |
+| `meridian profile disable <name>` | Stop routing new requests to a Claude profile; its sign-in is kept |
+| `meridian profile enable <name>` | Route requests to a disabled profile again |
 
 ### How it works
 

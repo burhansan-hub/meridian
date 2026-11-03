@@ -786,12 +786,14 @@ async function loadRouting() {
       + '</select>',
     envText: modeEnv,
   });
-  var usesPool = cfg.routing === 'priority' || cfg.routing === 'active+priority';
+  var usesPool = cfg.routing === 'priority' || cfg.routing === 'active+priority' || cfg.routing === 'balanced';
   h += '<div id="routing-order-wrap" style="margin-top:14px;'+(usesPool?'':'display:none')+'">'
     + '<div style="color:var(--muted);font-size:13px;margin-bottom:8px">'
     + (cfg.routing === 'active+priority'
         ? 'Fallback order - used when the active profile runs out. The active profile always goes first, wherever it sits in this list.'
-        : 'Pool order — highest priority first. Drained top to bottom.')
+        : cfg.routing === 'balanced'
+          ? 'Tie-break order. A new conversation goes to the account with the fewest requests in flight, then the lowest usage, then the one idle longest; this order settles what is left.'
+          : 'Pool order — highest priority first. Drained top to bottom.')
     + '</div>'
     + (orderEnv ? '<div class="setting-env" style="margin-bottom:8px">' + telemetryEsc(orderEnv) + '</div>' : '')
     + '<ol id="routing-order" style="margin:0;padding-left:22px">'

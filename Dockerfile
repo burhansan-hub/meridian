@@ -30,9 +30,13 @@ RUN rm -rf dist \
 # ---- Runtime stage ----
 FROM node:22-alpine
 
+# Every directory a volume may cover is created here, owned by claude: a fresh
+# named volume takes the ownership of the path it is mounted over, and one over
+# a missing path is created root-owned, which the uid-1000 server cannot write
+# its profiles, sessions or refreshed tokens into.
 RUN deluser --remove-home node 2>/dev/null; \
     adduser -D -u 1000 claude \
-    && mkdir -p /home/claude/.claude \
+    && mkdir -p /home/claude/.claude /home/claude/.config/meridian /home/claude/.cache/meridian \
     && chown -R claude:claude /home/claude
 
 # Alpine does not provide /etc/machine-id. Durable process-owner fencing needs

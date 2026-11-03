@@ -13,7 +13,8 @@ Environment variables, endpoints, authentication, SDK feature toggles, passthrou
 
 | Variable | Alias | Default | Description |
 |----------|-------|---------|-------------|
-| `MERIDIAN_API_KEY` | — | unset | Shared secret for API key authentication. When set, all API and admin routes require a matching `x-api-key` or `Authorization: Bearer` header. `/` and `/health` remain open. |
+| `MERIDIAN_API_KEY` | — | unset | Shared secret for API key authentication. When set, all API and admin routes require a matching `x-api-key` or `Authorization: Bearer` header, or a [web UI session](#web-ui-sign-in). `/` and `/health` remain open. |
+| `MERIDIAN_REQUIRE_PROFILE` | — | unset | `1`: every model request must name a registered, enabled profile in `x-meridian-profile`; see [requiring an explicit profile](profiles.md#requiring-an-explicit-profile). |
 | `MERIDIAN_PORT` | `CLAUDE_PROXY_PORT` | `3456` | Port to listen on |
 | `MERIDIAN_HOST` | `CLAUDE_PROXY_HOST` | `127.0.0.1` | Host to bind to |
 | `MERIDIAN_PASSTHROUGH` | `CLAUDE_PROXY_PASSTHROUGH` | unset | Forward tool calls to client instead of executing |
@@ -1316,6 +1317,24 @@ Clients just set their `ANTHROPIC_API_KEY` to the shared secret — since most t
 ```bash
 ANTHROPIC_API_KEY=your-secret-key ANTHROPIC_BASE_URL=http://meridian-host:3456 opencode
 ```
+
+### Web UI sign-in
+
+A browser cannot attach the key to a page load, so with `MERIDIAN_API_KEY` set
+the web UI asks for it once. Opening `/` or any gated page sends the browser to
+`/ui/login`; the key is exchanged there for a session cookie and the browser
+returns to the page it asked for. **Sign out** in the header ends the session.
+
+- The cookie is `HttpOnly` and `SameSite=Strict`, and `Secure` when the page was
+  reached over HTTPS (including through a TLS-terminating proxy that sets
+  `X-Forwarded-Proto`). It carries a random token, never the key.
+- Sessions last 12 hours and live in the Meridian process: a restart, or a
+  changed `MERIDIAN_API_KEY`, signs every browser out.
+- A request that sends a key is judged by that key alone, so a wrong key is
+  refused even from a signed-in browser. API calls without a key or session
+  still get `401`; only page loads are redirected.
+- `/ui/login`, `/ui/logout` and `/ui/session` are open; they grant nothing
+  without the key, and sign-in accepts only same-origin requests.
 
 ## Session bookkeeping maintenance
 

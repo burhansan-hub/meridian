@@ -89,6 +89,8 @@ export const profilePageHtml = `<!DOCTYPE html>
      border replaces an active card's brand border, and its brand ring stays
      outside the red, so the two still tell apart. */
   .profile-card.needs-login { border-color: var(--red); }
+  /* A disabled profile keeps its card and controls; only what it would serve fades. */
+  .profile-card.disabled > :not(.profile-card-header) { opacity: 0.55; }
   /* The header row carries the reorder handle, the name, every badge the
      card can earn - active, the type, out of a limit - and the actions. On a
      phone they do not fit on one line, and a row that cannot wrap pushed the
@@ -139,6 +141,8 @@ export const profilePageHtml = `<!DOCTYPE html>
   .badge-active { background: rgba(var(--brand-rgb, 88,166,255),0.15); color: var(--brand-bright, var(--accent)); }
   .badge-type { background: var(--bg); color: var(--muted); border: 1px solid var(--border); }
   .badge-needs-login { background: rgba(248,81,73,0.12); color: var(--red); border: 1px solid rgba(248,81,73,0.35); }
+  .badge-disabled { background: var(--bg); color: var(--muted); border: 1px solid var(--border); }
+  .icon-btn.text-btn { font-size: 11px; padding: 3px 8px; }
   .badge-spent { background: rgba(248,81,73,0.15); color: var(--red); border: 1px solid rgba(248,81,73,0.35); }
   .spent-note { margin: 10px 0; padding: 10px 14px; border-radius: 8px; font-size: 12px; line-height: 1.5;
     background: rgba(248,81,73,0.08); border: 1px solid rgba(248,81,73,0.3); color: var(--text);
@@ -419,7 +423,8 @@ ${reorderLiveRegionHtml}
       <code>meridian profile list</code> \u2014 show all profiles and auth status<br>
       <code>meridian profile login &lt;name&gt;</code> \u2014 re-authenticate an expired profile<br>
       <code>meridian profile rename &lt;old&gt; &lt;new&gt;</code> \u2014 rename a profile (or use the pencil above)<br>
-      <code>meridian profile remove &lt;name&gt;</code> \u2014 remove a profile
+      <code>meridian profile remove &lt;name&gt;</code> \u2014 remove a profile (or use the bin above)<br>
+      <code>meridian profile disable &lt;name&gt;</code> / <code>enable &lt;name&gt;</code> \u2014 take a profile out of routing and back, keeping its sign-in
     </div>
     <p style="font-size:13px;color:var(--muted);margin-top:12px">
       Renaming keeps the old name working: requests still naming it are served by
@@ -601,10 +606,37 @@ function cancelRemove() {
   redraw();
 }
 
+// Disable/enable errors, shown on the card they came from.
+var stateErrorProfile = null;
+var stateError = null;
+
+async function setDisabled(id, disabled) {
+  var data;
+  try {
+    var res = await fetch('/profiles/disable', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ profile: id, disabled: disabled })
+    });
+    data = await res.json();
+  } catch (err) {
+    data = { error: 'Could not reach Meridian.' };
+  }
+  if (data && data.success) {
+    stateErrorProfile = null;
+    stateError = null;
+    await refresh();
+    return;
+  }
+  stateErrorProfile = id;
+  stateError = (data && data.error) || (disabled ? 'Disable failed.' : 'Enable failed.');
+  redraw();
+}
+
 async function commitRemove(id) {
   var data;
   try {
-    var res = await fetch('/profiles/chatgpt/remove', {
+    var res = await fetch('/profiles/remove', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ profile: id })
@@ -1113,7 +1145,7 @@ function render(data, quotaData) {
     const needsLogin = isUnusable({ loggedIn: p.loggedIn, error: (quotaById[p.id] || {}).error });
     const update = meridianCardStatus.updateOf(p, lastProfilesRequestedAt);
     if (update && update.state === 'updating') anyUpdating = true;
-    html += '<div class="profile-card provider-' + esc(slot.provider) + (isActive ? ' active' : '') + (needsLogin ? ' needs-login' : '') + (update && update.state === 'updating' ? ' updating" aria-busy="true' : '') + '" id="' + esc(profileAnchorElementId(p.id)) + '" data-id="' + esc(p.id) + '" data-index="' + idx + '" data-group="' + esc(slot.provider) + '">';
+    html += '<div class="profile-card provider-' + esc(slot.provider) + (isActive ? ' active' : '') + (needsLogin ? ' needs-login' : '') + (p.disabled ? ' disabled' : '') + (update && update.state === 'updating' ? ' updating" aria-busy="true' : '') + '" id="' + esc(profileAnchorElementId(p.id)) + '" data-id="' + esc(p.id) + '" data-index="' + idx + '" data-group="' + esc(slot.provider) + '">';
     html += '<div class="profile-card-header">';
     if (editingProfile === p.id) {
       html += "<input class=\\"rename-input\\" id=\\"rename-input\\" value=\\"" + esc(p.id) + "\\" spellcheck=\\"false\\" autocomplete=\\"off\\""
@@ -1128,6 +1160,7 @@ function render(data, quotaData) {
       if (reorderable && slot.size > 1) html += meridianReorder.handleHtml(p.id, idx, slot.place, slot.size);
       html += "<a class=\\"profile-name\\" href=\\"#" + esc(encodeURIComponent(p.id)) + "\\" title=\\"Link to this profile\\">" + esc(p.id) + "</a>";
       if (isActive) html += "<span class=\\"profile-badge badge-active\\">active</span>";
+      if (p.disabled) html += '<span class="profile-badge badge-disabled" title="Takes no new requests. Its sign-in is kept; enable it to route requests to it again.">disabled</span>';
       html += meridianProviders.badgeHtml(slot.provider, "profile-badge");
       // A seat's type is its provider's name, which the badge before it says.
       if ((p.type || "claude-max") !== slot.provider) html += "<span class=\\"profile-badge badge-type\\">" + esc(p.type || "claude-max") + "</span>";
@@ -1141,7 +1174,11 @@ function render(data, quotaData) {
       if ((quotaById[p.id] || {}).servingOnCredits) html += '<span class="profile-badge badge-credits" title="This seat\u2019s plan usage is spent; its turns are paid with Codex credits">on credits</span>';
       html += "<span class=\\"profile-card-actions\\">";
       html += "<button class=\\"icon-btn\\" title=\\"Rename profile\\" onclick=\\"startRename(&quot;"+esc(p.id)+"&quot;)\\">" + ICON_PENCIL + "</button>";
-      if (isChatGptProfile(p)) html += "<button class=\\"icon-btn danger\\" title=\\"Remove seat\\" onclick=\\"startRemove(&quot;"+esc(p.id)+"&quot;)\\">" + ICON_TRASH + "</button>";
+      if (!isChatGptProfile(p)) {
+        html += '<button class="icon-btn text-btn" title="' + (p.disabled ? 'Route requests to this profile again' : 'Stop routing new requests to this profile; running ones finish') + '"'
+          + ' onclick="setDisabled(&quot;' + esc(p.id) + '&quot;,' + (p.disabled ? 'false' : 'true') + ')">' + (p.disabled ? 'Enable' : 'Disable') + '</button>';
+      }
+      html += "<button class=\\"icon-btn danger\\" title=\\"" + (isChatGptProfile(p) ? "Remove seat" : "Remove profile") + "\\" onclick=\\"startRemove(&quot;"+esc(p.id)+"&quot;)\\">" + ICON_TRASH + "</button>";
       html += "</span>";
     }
     html += '</div>';
@@ -1150,6 +1187,9 @@ function render(data, quotaData) {
 
     if (editingProfile === p.id && renameError) {
       html += '<div class="rename-error">' + esc(renameError) + '</div>';
+    }
+    if (stateErrorProfile === p.id && stateError) {
+      html += '<div class="rename-error">' + esc(stateError) + '</div>';
     }
 
     if (removingProfile === p.id && isChatGptProfile(p) && p.removal) {
@@ -1162,7 +1202,7 @@ function render(data, quotaData) {
       html += '</div></div>';
     } else if (removingProfile === p.id) {
       html += '<div class="remove-confirm">';
-      html += '<div class="remove-confirm-text">Remove <strong>' + esc(p.id) + '</strong>? Its stored credentials are deleted with it, so putting it back means logging in again.</div>';
+      html += '<div class="remove-confirm-text">Remove <strong>' + esc(p.id) + '</strong>? Its stored credentials are deleted with it, so putting it back means logging in again.' + (isChatGptProfile(p) ? '' : ' To keep the sign-in, disable it instead.') + '</div>';
       if (removeError) html += '<div class="rename-error">' + esc(removeError) + '</div>';
       html += '<div class="remove-confirm-actions">';
       html += '<button class="confirm-btn danger" onclick="commitRemove(&quot;'+esc(p.id)+'&quot;)">Remove</button>';
@@ -1182,7 +1222,9 @@ function render(data, quotaData) {
 
     html += renderUsageSection(quotaById[p.id], p);
 
-    if (!isActive) {
+    if (p.disabled) {
+      html += '<button class="switch-btn" disabled>Disabled</button>';
+    } else if (!isActive) {
       html += '<button class="switch-btn switch-to" onclick="switchProfile(&quot;'+esc(p.id)+'&quot;)">Switch to ' + esc(p.id) + '</button>';
     } else {
       html += '<button class="switch-btn current" disabled>Currently active</button>';

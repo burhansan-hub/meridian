@@ -123,7 +123,7 @@ function renderCards(profiles: Array<Record<string, unknown>>, quota: Array<Reco
     meridianPatch: { html: (target: { innerHTML: string }, markup: string) => { target.innerHTML = markup } },
     loginPanelOpen: () => false, lastProfilesRequestedAt: null, updatePollTimer: null,
     afterRender: none, loginSlot: () => null, activeLogin: null, editingProfile: null, renameError: null,
-    removingProfile: null, removeError: null, renderProviderChips: none, providersPresent: [],
+    removingProfile: null, removeError: null, stateErrorProfile: null, stateError: null, renderProviderChips: none, providersPresent: [],
     chatGptOwnerInfo: null, renderAccessNote: none, renderLoginRows: none,
     ICON_PENCIL: "", ICON_CHECK: "", ICON_X: "", ICON_TRASH: "",
   })

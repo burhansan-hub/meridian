@@ -205,6 +205,43 @@ docker run -e MERIDIAN_HOST_ID=meridian-local \
 
 This is the recommended path for CI runners, ephemeral containers, and cross-host deployments where browser-based login isn't reachable. Treat the token like any other secret — inject it via your platform's secret store rather than committing it to your image or compose file.
 
+### Deploying a published image
+
+`docker-compose.deploy.yml` runs a published image on a host that has no
+checkout of this repository: the host needs Docker and that one file.
+
+```bash
+# On a build machine
+docker build -t <registry>/meridian:<tag> .
+docker push <registry>/meridian:<tag>
+
+# On the deployment host, beside docker-compose.deploy.yml
+cat > .env <<'ENV'
+MERIDIAN_API_KEY=<openssl rand -hex 32>
+MERIDIAN_IMAGE=<registry>/meridian:<tag>
+MERIDIAN_BIND_HOST=<private IP of this host>
+ENV
+docker compose -f docker-compose.deploy.yml up -d
+```
+
+Open `http://<bind-host>:3456/`, [sign in](configuration.md#web-ui-sign-in) with
+the API key, and add each Claude account under **Add a profile** on `/profiles`.
+A browser on another machine finishes each sign-in by pasting the code Claude
+shows (see [why](profiles.md#from-the-web-ui-re-authenticate-a-profile-without-a-terminal)).
+Accounts can then be disabled, enabled and removed on the same page.
+
+The file persists all three directories below in named volumes, sets a stable
+`MERIDIAN_HOST_ID`, requires the API key, publishes on loopback unless
+`MERIDIAN_BIND_HOST` says otherwise, and defaults to
+[balanced routing](profiles.md#balanced-routing). Set `MERIDIAN_REQUIRE_PROFILE=1`
+when several tenants share the instance. The image pre-creates the volume
+paths owned by UID 1000, so fresh named volumes need no permission fix.
+
+One login must live in exactly one place: refresh tokens rotate when used, so
+two instances renewing copies of the same login eventually sign each other out.
+Sign each account in on the instance that will serve it rather than copying
+credential directories between hosts.
+
 ### Persistence and host identity
 
 Set `MERIDIAN_HOST_ID` to a stable value unique to each container that shares a session directory. The examples use `meridian-local` for one local instance; use a different value for another instance. This keeps session-lock ownership stable across container restarts.

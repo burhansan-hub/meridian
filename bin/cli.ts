@@ -83,7 +83,7 @@ See https://github.com/rynfar/meridian for full documentation.`)
 }
 
 if (args[0] === "profile") {
-  const { profileAdd, profileAddOauthToken, profileList, profileRemove, profileRename, profileSwitch, profileLogin, profileHelp } = await import("../src/proxy/profileCli")
+  const { profileAdd, profileAddOauthToken, profileList, profileRemove, profileSetDisabled, profileRename, profileSwitch, profileLogin, profileHelp } = await import("../src/proxy/profileCli")
   const subcommand = args[1]
   const profileId = args[2]
   const headless = args.includes("--headless")
@@ -100,6 +100,7 @@ if (args[0] === "profile") {
   }
   else if (subcommand === "list" || subcommand === "ls") await profileList()
   else if (subcommand === "remove" && profileId) await profileRemove(profileId)
+  else if ((subcommand === "disable" || subcommand === "enable") && profileId) profileSetDisabled(profileId, subcommand === "disable")
   else if (subcommand === "rename" && profileId && args[3]) await profileRename(profileId, args[3])
   else if (subcommand === "switch" && profileId) await profileSwitch(profileId)
   else if (subcommand === "login" && profileId) await profileLogin(profileId, { headless, chatgpt })

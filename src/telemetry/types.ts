@@ -31,6 +31,8 @@ export type RouteKind =
   | "active+priority"
   | "priority-hop"
   | "active+priority-hop"
+  | "balanced"
+  | "balanced-hop"
 
 /** One account attempt within a client request's route. */
 export interface RouteHop {

@@ -33,6 +33,8 @@ import { socketActivationFd, parseIdleExitSeconds, isModelRequestPath } from "./
 import type { Server } from "node:http"
 import { join } from "node:path"
 import { configPath } from "../configDir"
+import { withProfileConfigLock } from "./profileConfigStore"
+import { removeProfileLocked, setProfileDisabledLocked, type ProfileEditResult } from "./profileState"
 import { query } from "@anthropic-ai/claude-agent-sdk"
 import { rateLimitStore } from "./rateLimitStore"
 import { guardUpstreamIdle, UpstreamIdleError, type LateIdleDeadline } from "./streamIdleGuard"
@@ -150,7 +152,8 @@ import { translateResponsesToAnthropic, translateAnthropicToResponses, createRes
 import { flattenAssistantContent, normalizeStructuredUserContent, replayToolResultHeader, frameStructuredReplay, coalesceStructuredUserMessages, coalesceTrailingSystemReminders, layoutReplayBlocks, type ReplayPart } from "./replay"
 import { unstreamedAssistantBlockFrames } from "./unstreamedAssistant"
 import { extractAdvisorModel, extractSystemText, getLastUserMessage, stripAdvisorTools, stripNonStandardStreamFields, MULTIMODAL_TYPES, buildToolUseIndex, frameReplayTurns } from "./messages"
-import { requireAuth, authEnabled } from "./auth"
+import { requireAuth, authEnabled, hasValidUiSession, isConfiguredApiKey, issueUiSession, revokeUiSession, uiSessionCookie, uiSessionToken } from "./auth"
+import { uiLoginPageHtml } from "../telemetry/uiLoginPage"
 import { detectAdapter } from "./adapters/detect"
 import { rootSessionIdOf } from "./adapter"
 import { buildQueryOptions, isCliThinkingDisplay, promptCachingDisabled, passthroughThinking, resolveQueryConfigDir, singleTurnCapLiftRaisesBudget, type QueryContext } from "./query"
@@ -163,7 +166,7 @@ import { inspectExecutionHistory } from "./executionHistory"
 import { getAdapterTransforms } from "./transforms/registry"
 import { loadPlugins, getActiveTransforms } from "./plugins/loader"
 import type { LoadedPlugin } from "./plugins/types"
-import { authKeepaliveTargets, resolveProfile, listProfiles, setActiveProfile, getActiveProfileId, resolveActiveProfileId, getEffectiveProfiles, hasProfiles, restoreActiveProfile, invalidateDiskProfileCache, shareableCredentialDir, type ResolvedProfile } from "./profiles"
+import { authKeepaliveTargets, resolveProfile, resolveRequestProfile, ProfileRefusal, profileRequired, listProfiles, setActiveProfile, getActiveProfileId, resolveActiveProfileId, getEffectiveProfiles, hasProfiles, restoreActiveProfile, invalidateDiskProfileCache, shareableCredentialDir, type ResolvedProfile } from "./profiles"
 import { followStatus, startFollowPolling, stopFollowPolling, logFollowBanner, FOLLOW_POLL_INTERVAL_MS } from "./followActive"
 import { createChatGptLogin } from "./chatgpt/login"
 import { renderLoginCallbackPage } from "../telemetry/loginCallbackPage"
@@ -182,6 +185,9 @@ import {
   ACTIVE_PRIORITY,
   ROUTING_MODES,
   ProfileExhaustion,
+  ProfileLoad,
+  orderByLoad,
+  currentUsageReading,
   AssignmentStore,
   resolveCooldownUntil,
   cooldownCapMs,
@@ -190,7 +196,10 @@ import {
   WeeklyReserveTracker,
   WEEKLY_RESERVE_WINDOW,
   type CooldownWindow,
+  type CooldownWindowType,
   type PriorityAssignment,
+  type ProfileLoadReading,
+  type ProfileLoadTracker,
   type RoutingMode,
   type WeeklyReserveHold,
   type WeeklyUsageReading,
@@ -494,6 +503,21 @@ function credentialStoreForProfile(profile: ResolvedProfile): CredentialStore | 
   )
 }
 
+const PROFILE_REFUSAL_ERROR_TYPES = {
+  400: "invalid_request_error",
+  403: "permission_error",
+  404: "not_found_error",
+  503: "overloaded_error",
+} as const
+
+/** Anthropic-shaped error for a request the profile layer will not serve. */
+function profileRefusalResponse(c: Context, refusal: ProfileRefusal): Response {
+  return c.json({
+    type: "error",
+    error: { type: PROFILE_REFUSAL_ERROR_TYPES[refusal.status], message: refusal.message, code: refusal.code },
+  }, refusal.status)
+}
+
 async function ensureFreshTokenForProfiles(config: ProxyConfig): Promise<void> {
   const profiles = getEffectiveProfiles(config.profiles)
   if (profiles.length === 0) return
@@ -735,6 +759,8 @@ type PriorityDispatchOptions = {
   readonly wantsStream: boolean
   readonly currentProfileId: string | undefined
   readonly routing?: RoutingMode
+  /** Counts the request against the profile each attempt runs on. */
+  readonly load?: ProfileLoadTracker
   readonly turnWatchdogSignal?: AbortSignal
   readonly requestAbortLink?: RequestAbortLink
   readonly publicationTurn?: {
@@ -1524,6 +1550,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
   // deadlock the pool whenever MERIDIAN_MAX_CONCURRENT is 1. State is per
   // proxy instance.
   const priorityExhaustion = new ProfileExhaustion()
+  const profileLoad = new ProfileLoad()
   const PRIORITY_ASSIGNMENTS_MAX = 5000
   const priorityAssignments = new AssignmentStore(PRIORITY_ASSIGNMENTS_MAX)
   // The per-window reset cap lives in routing.ts (cooldownCapMs): a single
@@ -1551,13 +1578,47 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
 
   /** Already-observed weekly usage for one profile: never fetches. */
   function weeklyUsageReadings(profileId: string): WeeklyUsageReading[] {
+    return usageReadings(profileId, WEEKLY_RESERVE_WINDOW)
+  }
+
+  function usageReadings(profileId: string, windowType: CooldownWindowType): WeeklyUsageReading[] {
     const readings: WeeklyUsageReading[] = []
-    const sdk = rateLimitStore.get(profileId, WEEKLY_RESERVE_WINDOW)
+    const sdk = rateLimitStore.get(profileId, windowType)
     if (sdk) readings.push({ utilization: sdk.utilization, resetsAt: sdk.resetsAt, observedAt: sdk.observedAt })
     const oauth = peekOAuthUsage(profileId)
-    const window = oauth?.windows.find(w => w.type === WEEKLY_RESERVE_WINDOW)
+    const window = oauth?.windows.find(w => w.type === windowType)
     if (oauth && window) readings.push({ utilization: window.utilization, resetsAt: window.resetsAt, observedAt: oauth.fetchedAt })
     return readings
+  }
+
+  /** What `balanced` routing weighs for one profile; observed values only. */
+  function profileLoadReading(profileId: string): ProfileLoadReading {
+    const now = Date.now()
+    const utilizations = (["five_hour", "seven_day"] as const)
+      .map(windowType => currentUsageReading(usageReadings(profileId, windowType), now)?.utilization)
+      .filter((u): u is number => typeof u === "number")
+    return {
+      id: profileId,
+      inFlight: profileLoad.inFlight(profileId),
+      utilization: utilizations.length > 0 ? Math.max(...utilizations) : undefined,
+      lastStartedAt: profileLoad.lastStartedAt(profileId),
+    }
+  }
+
+  /** Dispatch through the pool, counting the request against the profile serving it until it is done. */
+  async function dispatchPoolWithLoad(options: Omit<PriorityDispatchOptions, "load">): Promise<Response> {
+    const load = profileLoad.track()
+    let response: Response
+    try {
+      response = await dispatchPriority({ ...options, load })
+    } catch (error) {
+      load.end()
+      throw error
+    }
+    const tracked = onResponseDone(response, load.end)
+    const completion = responseCompletions.get(response)
+    if (completion) responseCompletions.set(tracked, completion)
+    return tracked
   }
 
   const weeklyReserve = new WeeklyReserveTracker()
@@ -1775,6 +1836,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
           expectedAssignmentGeneration: options.durableRoute.expectedGeneration,
         }
       : undefined
+    options.load?.attempt(candidate)
     // Fork the hop's telemetry, retaining the request ID for routeChain.
     const attemptMeta = { ...forkAttemptMeta(options.requestMeta, attempt), routeAttempt: attempt + 1 }
     const inner = await handleMessages(options.context, attemptMeta, {
@@ -2166,9 +2228,61 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
 
   app.use("/auth/*", requireAuth)
 
+  // --- Web UI sign-in (only meaningful with MERIDIAN_API_KEY) ---
+  // Public by necessity: they are how a browser gets the session that the
+  // gated pages accept. They reveal only whether a key is configured, which
+  // the redirect to /ui/login reveals anyway, and grant nothing without it.
+  const uiSecureCookie = (c: Context) =>
+    new URL(c.req.url).protocol === "https:" || c.req.header("x-forwarded-proto") === "https"
+  const uiNextPath = (raw: string | undefined) =>
+    raw && raw.startsWith("/") && !raw.startsWith("//") && !raw.startsWith("/\\") ? raw : "/"
+
+  app.get("/ui/login", (c) => {
+    c.header("Cache-Control", "no-store")
+    c.header("X-Frame-Options", "DENY")
+    if (!authEnabled() || hasValidUiSession(c.req.header("cookie"))) return c.redirect(uiNextPath(c.req.query("next")), 303)
+    return c.html(uiLoginPageHtml)
+  })
+
+  app.post("/ui/login", async (c) => {
+    c.header("Cache-Control", "no-store")
+    if (!authEnabled()) return c.json({ error: "No API key is configured; the UI is open." }, 404)
+    if (!permitsLocalBrowserWrite(c.req.raw)) return c.json({ error: "Sign-in requires a same-origin request" }, 403)
+    let body: { key?: unknown }
+    try {
+      body = await c.req.json() as { key?: unknown }
+    } catch {
+      return c.json({ error: "Invalid JSON in request body" }, 400)
+    }
+    if (typeof body.key !== "string" || !isConfiguredApiKey(body.key.trim())) {
+      claudeLog("ui.sign_in_refused", { userAgent: c.req.header("user-agent")?.slice(0, 120) ?? null })
+      return c.json({ error: "Incorrect key." }, 401)
+    }
+    c.header("Set-Cookie", uiSessionCookie(issueUiSession(), uiSecureCookie(c)))
+    return c.json({ success: true })
+  })
+
+  app.post("/ui/logout", (c) => {
+    c.header("Cache-Control", "no-store")
+    revokeUiSession(uiSessionToken(c.req.header("cookie")))
+    c.header("Set-Cookie", uiSessionCookie("", uiSecureCookie(c), 0))
+    return c.json({ success: true })
+  })
+
+  app.get("/ui/session", (c) => {
+    c.header("Cache-Control", "no-store")
+    return c.json({ required: authEnabled(), signedIn: authEnabled() && hasValidUiSession(c.req.header("cookie")) })
+  })
+
   app.get("/", (c) => {
     // API clients get JSON, browsers get the landing page
     const accept = c.req.header("accept") || ""
+    // The landing page itself is public, but everything it shows comes from
+    // gated routes: a keyed instance sends a browser to sign in first.
+    if (authEnabled() && accept.includes("text/html") && !c.req.header("x-api-key") && !c.req.header("authorization")
+      && !hasValidUiSession(c.req.header("cookie"))) {
+      return c.redirect("/ui/login", 303)
+    }
     if (accept.includes("application/json") && !accept.includes("text/html")) {
       return c.json({
         status: "ok",
@@ -2587,8 +2701,12 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
         const routingMode = getRoutingMode(process.env.MERIDIAN_ROUTING ?? getSetting("routing"))
         attributedRoutingMode = routingMode
         // Priority mode (opt-in): unpinned requests are dispatched across the
+        if (profileRequired() && !options.forcedProfileId && !c.req.header("x-meridian-profile")) {
+          return profileRefusalResponse(c, new ProfileRefusal("This instance requires an x-meridian-profile header naming a registered profile.", 400, "profile_required"))
+        }
         if (isPoolRouting(routingMode) && !options.forcedProfileId && !c.req.header("x-meridian-profile")) {
-          const effectivePool = getEffectiveProfiles(finalConfig.profiles)
+          // A disabled profile keeps its credentials but takes no new work.
+          const effectivePool = getEffectiveProfiles(finalConfig.profiles).filter(p => !p.disabled)
           if (effectivePool.length > 1) {
             const { order: configuredOrder, unknown: notClaude } = resolvePriorityOrder(effectivePool.map(p => p.id), priorityProfileOrderSetting())
             // The saved order lists ChatGPT seats as well; those are not typos.
@@ -2708,7 +2826,10 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                 assignment = priorityAssignments.get(sessionKey)
               }
 
-              const shouldPromote = assignment !== undefined
+              // Balanced has no preferred account to fail back to: the
+              // least-loaded one is chosen afresh for each new conversation.
+              const shouldPromote = routingMode !== "balanced"
+                && assignment !== undefined
                 && durableRoute !== undefined
                 && routeMappingIsCurrent
                 && assignment.profileId !== preferred
@@ -2758,7 +2879,8 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                       .filter(id => !reserveHolds.has(id))
                 if (candidates.length === 0) candidates = [order[0]!]
               } else {
-                const pick = choosePriorityProfile(order, id => priorityExhaustion.isExhausted(id))
+                const ranked = routingMode === "balanced" ? orderByLoad(order, profileLoadReading) : order
+                const pick = choosePriorityProfile(ranked, id => priorityExhaustion.isExhausted(id))
                 const first = retainOnlyProfile
                   ?? (shouldPromote
                     ? preferred
@@ -2770,9 +2892,9 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                 // that the durable route has no authenticated authority to adopt.
                 candidates = retainOnlyProfile
                   ? [retainOnlyProfile]
-                  : [first, ...order.filter(id => id !== first && !priorityExhaustion.isExhausted(id))]
+                  : [first, ...ranked.filter(id => id !== first && !priorityExhaustion.isExhausted(id))]
               }
-              return dispatchPriority({
+              return dispatchPoolWithLoad({
                 context: c,
                 body,
                 requestMeta,
@@ -2791,14 +2913,20 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
           }
         }
 
-        const profile = resolveProfile(
-          finalConfig.profiles,
-          finalConfig.defaultProfile,
-          options.forcedProfileId || c.req.header("x-meridian-profile") || undefined,
-          routingMode === "sticky"
-            ? { routingMode, stickySessionKey: rootSessionIdOf(adapter, c, body) }
-            : undefined
-        )
+        let profile: ResolvedProfile
+        try {
+          profile = resolveRequestProfile(
+            finalConfig.profiles,
+            finalConfig.defaultProfile,
+            options.forcedProfileId || c.req.header("x-meridian-profile") || undefined,
+            routingMode === "sticky"
+              ? { routingMode, stickySessionKey: rootSessionIdOf(adapter, c, body) }
+              : undefined
+          )
+        } catch (error) {
+          if (error instanceof ProfileRefusal) return profileRefusalResponse(c, error)
+          throw error
+        }
         // Also identifies failure telemetry; priority retries resolve each account here.
         resolvedProfileId = profile.id
         attributedProfileId = profile.id
@@ -10383,6 +10511,9 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
             ...priorityExhaustion.snapshot(),
             ...chatGptExhaustion.snapshot().map(mark => ({ ...mark, id: chatGptProfiles?.profileIdFor(mark.id) ?? mark.id })),
           ],
+          // Pool requests running per Claude profile, the first thing
+          // balanced routing weighs.
+          inFlight: Object.fromEntries(profiles.map(p => [p.id, profileLoad.inFlight(p.id)])),
         }
       : {}
     // Additive: follow state, so UIs can say where the active profile comes
@@ -10852,6 +10983,102 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     const chatGptSeat = chatGptProfiles?.resolve(body.profile)
     if (!chatGptSeat) return c.json({ error: `No ChatGPT seat is called "${body.profile}".`, code: "unknown_profile" }, 404)
     return removeChatGptSeat(c, chatGptSeat)
+  })
+
+  // Taking a Claude profile out of the rotation keeps its credentials:
+  // running requests finish, new ones go elsewhere, and enabling it again
+  // needs no sign-in. Same-origin like the ChatGPT changes, because a
+  // foreign page must not be able to take an unkeyed instance's accounts
+  // out of service.
+  app.post("/profiles/disable", async (c) => {
+    if (!permitsLocalBrowserWrite(c.req.raw)) return c.json({ error: "Profile changes require a same-origin request" }, 403)
+    let body: { profile?: unknown; disabled?: unknown }
+    try {
+      body = await c.req.json() as { profile?: unknown; disabled?: unknown }
+    } catch {
+      return c.json({ error: "Invalid JSON in request body" }, 400)
+    }
+    if (typeof body.profile !== "string" || !body.profile || typeof body.disabled !== "boolean") {
+      return c.json({ error: "Expected { profile: string, disabled: boolean }" }, 400)
+    }
+    if (chatGptProfiles?.resolve(body.profile)) {
+      return c.json({ error: `"${body.profile}" is a ChatGPT seat; only Claude profiles can be disabled.`, code: "unsupported_profile" }, 400)
+    }
+    if (envBool("CREDENTIALS_READONLY")) {
+      return c.json({ error: "MERIDIAN_CREDENTIALS_READONLY=1 — this instance may not modify profiles." }, 403)
+    }
+    const file = configPath("profiles.json")
+    const { disabled } = body
+    const profileId = body.profile
+    let result: ProfileEditResult
+    try {
+      result = await withProfileConfigLock(file, () => setProfileDisabledLocked(file, profileId, disabled))
+    } catch (error) {
+      return c.json({ error: (error as Error).message, code: "store_write_failed" }, 503)
+    }
+    if (!result.ok) return c.json({ error: result.error, code: "unknown_profile" }, 404)
+    invalidateDiskProfileCache()
+    claudeLog(disabled ? "profile.disabled" : "profile.enabled", {
+      profile: profileId,
+      userAgent: c.req.header("user-agent")?.slice(0, 120) ?? null,
+      origin: c.req.header("origin") ?? c.req.header("referer")?.slice(0, 120) ?? null,
+    })
+    plog(`[PROXY] Profile ${disabled ? "disabled" : "enabled"}: ${profileId}`)
+    return c.json({ success: true, profile: profileId, disabled })
+  })
+
+  // Removes the profile and the credential directory Meridian created for
+  // it. A ChatGPT seat is removed the way /profiles/chatgpt/remove does.
+  app.post("/profiles/remove", async (c) => {
+    if (!permitsLocalBrowserWrite(c.req.raw)) return c.json({ error: "Profile changes require a same-origin request" }, 403)
+    let body: { profile?: unknown }
+    try {
+      body = await c.req.json() as { profile?: unknown }
+    } catch {
+      return c.json({ error: "Invalid JSON in request body" }, 400)
+    }
+    if (typeof body.profile !== "string" || !body.profile) {
+      return c.json({ error: "Missing 'profile' in request body" }, 400)
+    }
+    const seat = chatGptProfiles?.resolve(body.profile)
+    if (seat) return removeChatGptSeat(c, seat)
+    if (envBool("CREDENTIALS_READONLY")) {
+      return c.json({ error: "MERIDIAN_CREDENTIALS_READONLY=1 — this instance may not modify credentials." }, 403)
+    }
+    const file = configPath("profiles.json")
+    const profileId = body.profile
+    let result: ProfileEditResult
+    try {
+      result = await withProfileConfigLock(file, () => removeProfileLocked(file, profileId, configPath("profiles")))
+    } catch (error) {
+      return c.json({ error: (error as Error).message, code: "store_write_failed" }, 503)
+    }
+    if (!result.ok) return c.json({ error: result.error, code: "unknown_profile" }, 404)
+    invalidateDiskProfileCache()
+    // The persisted pointer must not name a profile that is gone: every
+    // request would warn and fall through to the first profile anyway.
+    const remaining = getEffectiveProfiles(finalConfig.profiles)
+    const pointerMoves = getActiveProfileId() === profileId
+    const successor = remaining.find(p => !p.disabled) ?? remaining[0]
+    if (pointerMoves && successor) setActiveProfile(successor.id)
+    priorityExhaustion.forget(profileId)
+    spentProfiles.forget(profileId)
+    profileFactsRefresh.forget(profileId)
+    rateLimitStore.clear(profileId)
+    claudeLog("profile.removed", {
+      profile: profileId,
+      provider: "claude",
+      remaining: remaining.length,
+      userAgent: c.req.header("user-agent")?.slice(0, 120) ?? null,
+      origin: c.req.header("origin") ?? c.req.header("referer")?.slice(0, 120) ?? null,
+    })
+    plog(`[PROXY] Profile removed: ${profileId}${pointerMoves ? ` (active moves to ${successor?.id ?? "none"})` : ""}`)
+    return c.json({
+      success: true,
+      profile: profileId,
+      activeProfile: pointerMoves ? successor?.id ?? null : undefined,
+      remaining: remaining.map(p => p.id),
+    })
   })
 
   // --- Profile login routes (browser-completable OAuth) ---
@@ -11576,7 +11803,13 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
   // comparison here used to advertise 200k to Team accounts that Meridian was
   // already routing to opus[1m] (#826).
   app.get("/v1/models", async (c) => {
-    const profile = resolveProfile(finalConfig.profiles, finalConfig.defaultProfile)
+    let profile: ResolvedProfile
+    try {
+      profile = resolveRequestProfile(finalConfig.profiles, finalConfig.defaultProfile, c.req.header("x-meridian-profile") || undefined)
+    } catch (error) {
+      if (error instanceof ProfileRefusal) return profileRefusalResponse(c, error)
+      throw error
+    }
     const profileEnvOverrides = Object.keys(profile.env).length > 0 ? profile.env : undefined
     const authStatus = await getInstanceAuthStatus(
       profile.id !== "default" ? profile.id : undefined,
@@ -11958,11 +12191,17 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
   // auth resolved by the design module (design token first, then profile
   // credentials).
   app.post("/v1/design/*", async (c) => {
-    const profile = resolveProfile(
-      finalConfig.profiles,
-      finalConfig.defaultProfile,
-      c.req.header("x-meridian-profile") || undefined
-    )
+    let profile: ResolvedProfile
+    try {
+      profile = resolveRequestProfile(
+        finalConfig.profiles,
+        finalConfig.defaultProfile,
+        c.req.header("x-meridian-profile") || undefined
+      )
+    } catch (error) {
+      if (error instanceof ProfileRefusal) return profileRefusalResponse(c, error)
+      throw error
+    }
     const url = new URL(c.req.url)
     const upstreamUrl = `${DESIGN_UPSTREAM_ORIGIN}${url.pathname}${url.search}`
 

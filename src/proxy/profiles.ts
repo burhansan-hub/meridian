@@ -12,12 +12,17 @@
  *      another instance under MERIDIAN_FOLLOW_ACTIVE — see followActive.ts)
  *   3. First configured profile (or implicit "default" if none configured)
  *
+ * A profile marked `disabled` keeps its credentials but serves no requests:
+ * the fallback chain skips it and an explicit request for it is refused
+ * (see resolveRequestProfile).
+ *
  * This is a leaf module — no imports from server.ts or session/.
  */
 
 import { existsSync, readFileSync } from "node:fs"
 import { join } from "node:path"
 import { configPath, defaultConfigDir } from "../configDir"
+import { envBool } from "../env"
 import { setSetting, getSetting } from "../settings"
 import { pickStickyProfile, type RoutingMode } from "./routing"
 import { adoptedProfiles, followedActiveProfile } from "./followActive"
@@ -134,6 +139,11 @@ export interface ProfileConfig {
    * profileRename.ts), so every alias points straight at its current profile.
    */
   aliases?: string[]
+  /**
+   * Taken out of service from the profiles page or `meridian profile disable`.
+   * Requests already running on it finish; no new request is routed to it.
+   */
+  disabled?: boolean
 }
 
 export interface ResolvedProfile {
@@ -330,24 +340,94 @@ export function resolveProfile(
     return { id: DEFAULT_PROFILE_ID, type: "claude-max", env: {} }
   }
 
+  // Only an explicit request may name a disabled profile (re-login, refresh
+  // and listing act on one); every implicit step skips it. With every profile
+  // disabled the chain falls back to the full list, and resolveRequestProfile
+  // refuses the result.
+  const enabled = effective.filter(p => !p.disabled)
+  const candidates = enabled.length > 0 ? enabled : effective
+
   // Sticky assignment: only in sticky mode, only with a session identity,
   // and always subordinate to an explicit header override.
   const stickyId =
     options?.routingMode === "sticky" && options.stickySessionKey
-      ? pickStickyProfile(options.stickySessionKey, effective.map(p => p.id))
+      ? pickStickyProfile(options.stickySessionKey, candidates.map(p => p.id))
       : undefined
 
   // Priority: header > sticky > active > config default > first profile
   const activeId = resolveActiveProfileId(effective.map(p => p.id))
-  const resolvedId = requestedId || stickyId || activeId || defaultProfile || effective[0]!.id
+  const preferredId = activeId || defaultProfile
+  const preferredIsDisabled = preferredId !== undefined && enabled.length > 0
+    && findProfileByIdOrAlias(effective, preferredId)?.disabled === true
+  const resolvedId = requestedId || stickyId || (preferredIsDisabled ? undefined : preferredId) || candidates[0]!.id
   const profile = findProfileByIdOrAlias(effective, resolvedId)
 
   if (!profile) {
     console.warn(`[meridian] Unknown profile "${resolvedId}". Using first configured profile.`)
-    return buildResolvedProfile(effective[0]!)
+    return buildResolvedProfile(candidates[0]!)
   }
 
   return buildResolvedProfile(profile)
+}
+
+/** A request the profile layer will not serve, with the HTTP answer for it. */
+export class ProfileRefusal extends Error {
+  constructor(
+    message: string,
+    readonly status: 400 | 403 | 404 | 503,
+    readonly code: "profile_required" | "unknown_profile" | "profile_disabled" | "no_enabled_profile",
+  ) {
+    super(message)
+    this.name = "ProfileRefusal"
+  }
+}
+
+/**
+ * MERIDIAN_REQUIRE_PROFILE=1: every model request must name a registered
+ * profile in x-meridian-profile. For an instance shared by several tenants,
+ * where serving a request from some other account is worse than refusing it.
+ */
+export function profileRequired(): boolean {
+  return envBool("REQUIRE_PROFILE")
+}
+
+/**
+ * resolveProfile for a request that will spend an account's quota. Unlike the
+ * admin paths it never serves a disabled profile, and under
+ * MERIDIAN_REQUIRE_PROFILE it never substitutes another account for a missing
+ * or unknown one. Throws ProfileRefusal.
+ */
+export function resolveRequestProfile(
+  profiles: ProfileConfig[] | undefined,
+  defaultProfile: string | undefined,
+  requestedId?: string,
+  options?: ResolveProfileOptions
+): ResolvedProfile {
+  if (profileRequired()) {
+    if (!requestedId) {
+      throw new ProfileRefusal("This instance requires an x-meridian-profile header naming a registered profile.", 400, "profile_required")
+    }
+    // Re-read the registry so a profile removed or disabled by another process
+    // is refused now rather than after the cache expires.
+    invalidateDiskProfileCache()
+    if (!findProfileByIdOrAlias(getEffectiveProfiles(profiles), requestedId)) {
+      throw new ProfileRefusal(`No profile is called "${requestedId}".`, 404, "unknown_profile")
+    }
+  }
+  const effective = getEffectiveProfiles(profiles)
+  const resolved = resolveProfile(profiles, defaultProfile, requestedId, options)
+  const config = effective.find(p => p.id === resolved.id)
+  if (config?.disabled) {
+    throw requestedId
+      ? new ProfileRefusal(`Profile "${resolved.id}" is disabled.`, 403, "profile_disabled")
+      : new ProfileRefusal("Every profile is disabled.", 503, "no_enabled_profile")
+  }
+  return resolved
+}
+
+/** Ids of the profiles that may receive new requests. */
+export function enabledProfileIds(profiles: ProfileConfig[] | undefined): string[] {
+  return getEffectiveProfiles(profiles).filter(p => !p.disabled).map(p => p.id)
 }
 
 export function authKeepaliveTargets(
@@ -421,7 +501,7 @@ function buildResolvedProfile(profile: ProfileConfig): ResolvedProfile {
 export function listProfiles(
   profiles: ProfileConfig[] | undefined,
   defaultProfile: string | undefined
-): Array<{ id: string; type: ProfileType; isActive: boolean; aliases?: string[] }> {
+): Array<{ id: string; type: ProfileType; isActive: boolean; aliases?: string[]; disabled?: true }> {
   const effective = getEffectiveProfiles(profiles)
   if (effective.length === 0) return []
 
@@ -431,5 +511,6 @@ export function listProfiles(
     type: p.type ?? "claude-max",
     isActive: p.id === currentActive,
     ...(p.aliases && p.aliases.length > 0 ? { aliases: p.aliases } : {}),
+    ...(p.disabled ? { disabled: true as const } : {}),
   }))
 }

@@ -19,8 +19,12 @@ Own the operator's **Claude accounts** and decide which one serves a request:
   (`duplicateProfiles.ts`) and the post-sign-in re-read state
   (`profileFactsRefresh.ts`);
 - routing modes (`routing.ts`): `active` (default), `sticky` (rendezvous
-  hashing), `priority` (fail-over pool) and `active+priority`, plus
+  hashing), `priority` (fail-over pool), `active+priority` and `balanced`
+  (the priority pool ordered by load per new conversation), plus
   follow-another-instance mode (`followActive.ts`);
+- disabled profiles and `MERIDIAN_REQUIRE_PROFILE` (`profileState.ts`,
+  `resolveRequestProfile`): request paths never serve a disabled profile and,
+  in strict mode, never substitute another account for the one named;
 - per-profile rate-limit and exhaustion tracking (`rateLimitStore.ts`,
   `limitDetection.ts`) and human-turn attestation verification for priority
   failback (`priorityAttestation.ts`).
@@ -44,6 +48,15 @@ User-facing behavior: `docs/profiles.md`. Throttling and `[1m]` bench scope:
 
 ## Decisions
 
+- **Balanced reuses the priority pool.** Only the candidate order differs:
+  fewest pool requests in flight, then the higher of current five-hour and
+  weekly utilization (observed only, never fetched), then idle longest, then
+  the configured order. Affinity, cooldowns, failover and the weekly reserve
+  are priority's; failback is off because no account is preferred. A request
+  counts against the account it is currently trying, so a failover moves it.
+- **Disabled is a request-path rule, not a hidden profile.** Listing,
+  re-login, renewal and removal still act on a disabled profile; only
+  `resolveRequestProfile` and the pool leave it out.
 - **Automatic account switching is opt-in.** Several users explicitly do not
   want it, so the default stays `active`. `MERIDIAN_ROUTING` /
   `MERIDIAN_PROFILE_ORDER` fall back to settings; unknown ids are logged and

@@ -268,6 +268,8 @@ var ROUTE_KIND_COLOR = {
   'active+priority': 'var(--yellow)',
   'priority-hop': 'var(--muted)',
   'active+priority-hop': 'var(--muted)',
+  balanced: 'var(--yellow)',
+  'balanced-hop': 'var(--muted)',
 };
 
 // routeChain arrives oldest attempt first; the last entry is the one that answered.

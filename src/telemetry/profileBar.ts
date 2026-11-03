@@ -316,6 +316,7 @@ export const profileBarHtml = `
     <a href="/profiles" id="nav-profiles">Profiles</a>
     <a href="/settings" id="nav-settings">Settings</a>
     <a href="/plugins" id="nav-plugins">Plugins</a>
+    <a href="/ui/login" id="nav-signout" hidden>Sign out</a>
   </nav>
   <div class="mh-right">
     <span class="mh-prov" id="mhProv" role="group"></span>
@@ -633,6 +634,17 @@ export const profileBarJs = `
   }
 
   loadHeader();
+
+  // Shown only to a browser signed in with the API key; an unkeyed instance
+  // has no session to end.
+  var signOut = document.getElementById('nav-signout');
+  fetch('/ui/session', { cache: 'no-store' }).then(function(r) { return r.json(); }).then(function(s) {
+    signOut.hidden = !(s && s.signedIn);
+  }).catch(function() {});
+  signOut.addEventListener('click', function(event) {
+    event.preventDefault();
+    fetch('/ui/logout', { method: 'POST' }).finally(function() { location.replace('/ui/login'); });
+  });
   setInterval(loadHeader, 10000);
   // Pages call this after mutating state (e.g. switching the active profile)
   // so the header chip updates immediately instead of on the next poll.

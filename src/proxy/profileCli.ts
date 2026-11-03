@@ -33,6 +33,7 @@ import {
 } from "./profileRename"
 import { getSetting, setSetting } from "../settings"
 import { publishProfileConfig, readProfileConfigForUpdate, withProfileConfigLock, withProfileConfigLockSync } from "./profileConfigStore"
+import { removeProfileLocked, setProfileDisabledLocked } from "./profileState"
 import { createPlatformCredentialStore, type CredentialsFile } from "./tokenRefresh"
 
 const OAUTH_AUTHORIZE_URL = "https://claude.com/cai/oauth/authorize"
@@ -759,26 +760,7 @@ async function chatGptSignInOrExit(id: string, options: AuthLoginOptions): Promi
   if (!await signInChatGptSeat(id, { headless: options.headless }, seatContext())) process.exit(1)
 }
 
-/**
- * Pure: resolve which on-disk directories should be removed when this profile
- * is deleted. Browser-login profiles drop their explicit `claudeConfigDir`
- * (provided it lives under `profilesDir`); oauth-token profiles drop the
- * pinned isolation dir at `profilesDir/<id>` (created by the SDK during use,
- * not stored on the profile itself).
- *
- * Caller is responsible for the actual `rmSync` — this returns paths only.
- */
-export function dirsToRemoveOnProfileRemove(profile: ProfileConfig, profilesDir: string): string[] {
-  const dirs: string[] = []
-  if (profile.claudeConfigDir?.startsWith(profilesDir)) {
-    dirs.push(profile.claudeConfigDir)
-  }
-  if (profile.oauthToken || profile.type === "oauth-token") {
-    const isolationDir = join(profilesDir, profile.id)
-    if (!dirs.includes(isolationDir)) dirs.push(isolationDir)
-  }
-  return dirs
-}
+export { dirsToRemoveOnProfileRemove } from "./profileState"
 
 export async function profileRemove(id: string): Promise<void> {
   if (chatGptSeatNamed(id)) {
@@ -793,28 +775,33 @@ export async function profileRemove(id: string): Promise<void> {
 }
 
 function profileRemoveLocked(id: string): void {
-  const profiles = readProfileConfigForUpdate(profilesConfigFile())
-  const idx = profiles.findIndex(p => p.id === id)
-  if (idx === -1) {
-    throw new Error(`Profile "${id}" not found.`)
-  }
-
-  const removed = profiles[idx]
-  if (!removed) {
-    throw new Error(`Profile "${id}" not found.`)
-  }
-  const dirsToRemove = dirsToRemoveOnProfileRemove(removed, configPath("profiles"))
-  profiles.splice(idx, 1)
-  saveProfileConfig(profiles)
-
-  for (const dir of dirsToRemove) {
-    if (existsSync(dir)) rmSync(dir, { recursive: true, force: true })
-  }
+  ensureProfilesDir()
+  const result = removeProfileLocked(profilesConfigFile(), id, configPath("profiles"))
+  if (!result.ok) throw new Error(result.error)
 
   console.log(`\x1b[32m✓ Profile "${id}" removed.\x1b[0m`)
+  const profiles = readProfileConfigForUpdate(profilesConfigFile())
   if (profiles.length > 0) {
     printEnvHint(profiles)
   }
+}
+
+/** `meridian profile disable|enable <name>`: take a Claude profile out of service, or put it back. */
+export function profileSetDisabled(id: string, disabled: boolean): void {
+  if (chatGptSeatNamed(id)) {
+    console.error(`\x1b[31m✗ "${id}" is a ChatGPT seat; only Claude profiles can be ${disabled ? "disabled" : "enabled"}.\x1b[0m`)
+    process.exit(1)
+  }
+  try {
+    const result = withProfileConfigLockSync(profilesConfigFile(), () => setProfileDisabledLocked(profilesConfigFile(), id, disabled))
+    if (!result.ok) throw new Error(result.error)
+  } catch (error) {
+    console.error(`✗ ${error instanceof Error ? error.message : String(error)}`)
+    process.exit(1)
+  }
+  console.log(disabled
+    ? `\x1b[32m✓ Profile "${id}" disabled.\x1b[0m Running requests finish; no new request is routed to it.`
+    : `\x1b[32m✓ Profile "${id}" enabled.\x1b[0m`)
 }
 
 export function profileRename(from: string, to: string): void {
@@ -1039,6 +1026,8 @@ Commands:
   meridian profile list                             List profiles and auth status
   meridian profile rename <old> <new>               Rename a profile; <old> keeps routing to it until reused
   meridian profile remove <name>                    Remove a profile
+  meridian profile disable <name>                   Stop routing new requests to a Claude profile
+  meridian profile enable <name>                    Route requests to a disabled profile again
   meridian profile switch <name>                    Switch the active profile (requires running proxy)
   meridian profile login <name> [--headless]        Re-authenticate a profile, adding it first if it does not
                                                     exist yet (claude-max only)

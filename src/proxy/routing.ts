@@ -25,7 +25,7 @@
 import { createHash } from "node:crypto"
 import type { RouteKind } from "../telemetry/types"
 
-export type RoutingMode = "active" | "sticky" | "priority" | "active+priority"
+export type RoutingMode = "active" | "sticky" | "priority" | "active+priority" | "balanced"
 
 export const ACTIVE_PRIORITY = "active+priority" as const
 
@@ -35,7 +35,7 @@ export const ACTIVE_PRIORITY = "active+priority" as const
  * settings route's validator and a third time in the page's `<select>`, so a
  * new mode parsed correctly and still could not be selected.
  */
-export const ROUTING_MODES: readonly RoutingMode[] = ["active", "sticky", "priority", ACTIVE_PRIORITY]
+export const ROUTING_MODES: readonly RoutingMode[] = ["active", "sticky", "priority", ACTIVE_PRIORITY, "balanced"]
 
 export type PriorityFailbackPolicy = "new-conversation" | "next-user-turn"
 
@@ -67,12 +67,13 @@ export function getRoutingMode(raw: string | undefined): RoutingMode {
   const lower = raw?.toLowerCase()
   if (lower === "sticky") return "sticky"
   if (lower === "priority") return "priority"
+  if (lower === "balanced") return "balanced"
   if (lower && lower.replace(/[\s+_-]/g, "") === "activepriority") return ACTIVE_PRIORITY
   return "active"
 }
 
 export function isPoolRouting(mode: RoutingMode): boolean {
-  return mode === "priority" || mode === ACTIVE_PRIORITY
+  return mode === "priority" || mode === ACTIVE_PRIORITY || mode === "balanced"
 }
 
 export function getPriorityFailbackPolicy(raw: string | undefined): PriorityFailbackPolicy {
@@ -109,11 +110,16 @@ export function classifyRouteKind(input: {
   // Checked before the pin, even though every hop carries one: a hop IS pinned,
   // so testing the header first would report the mechanism instead of the
   // reason and make every failover attempt read as a deliberate pin.
-  if (input.priorityHop) return input.routingMode === ACTIVE_PRIORITY ? "active+priority-hop" : "priority-hop"
+  if (input.priorityHop) {
+    if (input.routingMode === ACTIVE_PRIORITY) return "active+priority-hop"
+    if (input.routingMode === "balanced") return "balanced-hop"
+    return "priority-hop"
+  }
   if (input.pinnedProfileHeader) return "pinned"
   if (input.routingMode === "sticky") return "sticky"
   if (input.routingMode === "priority") return "priority"
   if (input.routingMode === ACTIVE_PRIORITY) return ACTIVE_PRIORITY
+  if (input.routingMode === "balanced") return "balanced"
   if (input.routingMode === "active") return "active"
   return undefined
 }
@@ -247,6 +253,93 @@ export function chooseActivePriorityCandidates(
     first = pool.find(id => !isExhausted(id)) ?? activeId
   }
   return [first, ...pool.filter(id => id !== first && !isExhausted(id))]
+}
+
+/**
+ * What `balanced` routing knows about one profile when a new conversation
+ * needs an account. Every field is something Meridian already observed; none
+ * is fetched for the decision.
+ */
+export interface ProfileLoadReading {
+  id: string
+  /** Pool requests currently running on (or being tried against) it. */
+  inFlight: number
+  /** Highest current account-window utilization, 0..1, or undefined when not measured. */
+  utilization: number | undefined
+  /** Epoch ms the last pool request started on it, or undefined when none has. */
+  lastStartedAt: number | undefined
+}
+
+/**
+ * Order for `balanced` routing: fewest requests in flight first, then the
+ * lower measured usage, then the profile idle longest. Remaining ties keep
+ * the configured order, so the result is deterministic.
+ *
+ * An unmeasured profile ranks as unused. It may be, and the first request it
+ * serves reports its usage, so it is not starved for lack of a reading.
+ */
+export function orderByLoad(
+  order: readonly string[],
+  readingFor: (id: string) => ProfileLoadReading,
+): string[] {
+  const rank = new Map(order.map((id, index) => [id, index]))
+  const readings = order.map(readingFor)
+  return readings
+    .sort((a, b) =>
+      a.inFlight - b.inFlight
+      || (a.utilization ?? 0) - (b.utilization ?? 0)
+      || (a.lastStartedAt ?? -Infinity) - (b.lastStartedAt ?? -Infinity)
+      || rank.get(a.id)! - rank.get(b.id)!)
+    .map(reading => reading.id)
+}
+
+/** Holds one request's place on whichever profile it is currently trying. */
+export interface ProfileLoadTracker {
+  /** The request moved to `id`: release the previous profile and count this one. */
+  attempt(id: string): void
+  /** The request is finished. Idempotent. */
+  end(): void
+}
+
+/**
+ * Pool requests in flight per profile, for `balanced` routing. A request
+ * counts against exactly one profile at a time: a failover moves it, so an
+ * account that refused it is not charged while the next one serves it.
+ * In-memory only, like the exhaustion marks.
+ */
+export class ProfileLoad {
+  private readonly inFlightById = new Map<string, number>()
+  private readonly lastStartedById = new Map<string, number>()
+
+  constructor(private readonly now: () => number = Date.now) {}
+
+  track(): ProfileLoadTracker {
+    let current: string | undefined
+    const release = () => {
+      if (current === undefined) return
+      const left = (this.inFlightById.get(current) ?? 1) - 1
+      if (left > 0) this.inFlightById.set(current, left)
+      else this.inFlightById.delete(current)
+      current = undefined
+    }
+    return {
+      attempt: (id) => {
+        release()
+        current = id
+        this.inFlightById.set(id, (this.inFlightById.get(id) ?? 0) + 1)
+        this.lastStartedById.set(id, this.now())
+      },
+      end: release,
+    }
+  }
+
+  inFlight(id: string): number {
+    return this.inFlightById.get(id) ?? 0
+  }
+
+  lastStartedAt(id: string): number | undefined {
+    return this.lastStartedById.get(id)
+  }
 }
 
 export interface ExhaustionEntry {
@@ -501,16 +594,14 @@ export function parseWeeklyReserves(
 }
 
 /**
- * Whether a profile is holding its weekly reserve, from the newest reading
- * that still describes the current window: a reading past its reset, or one
- * with no reset older than WEEKLY_RESERVE_UNKNOWN_RESET_MAX_AGE_MS, is
- * ignored. No usable reading means no hold.
+ * The newest reading that still describes the current window: a reading past
+ * its reset, or one with no reset older than
+ * WEEKLY_RESERVE_UNKNOWN_RESET_MAX_AGE_MS, is ignored.
  */
-export function weeklyReserveHold(
-  reservePercent: number,
+export function currentUsageReading(
   readings: readonly WeeklyUsageReading[],
   now: number,
-): WeeklyReserveHold | undefined {
+): WeeklyUsageReading | undefined {
   let newest: WeeklyUsageReading | undefined
   for (const reading of readings) {
     if (typeof reading.utilization !== "number" || !Number.isFinite(reading.utilization)) continue
@@ -521,6 +612,21 @@ export function weeklyReserveHold(
     }
     if (!newest || reading.observedAt > newest.observedAt) newest = reading
   }
+  return newest
+}
+
+/**
+ * Whether a profile is holding its weekly reserve, from the newest reading
+ * that still describes the current window: a reading past its reset, or one
+ * with no reset older than WEEKLY_RESERVE_UNKNOWN_RESET_MAX_AGE_MS, is
+ * ignored. No usable reading means no hold.
+ */
+export function weeklyReserveHold(
+  reservePercent: number,
+  readings: readonly WeeklyUsageReading[],
+  now: number,
+): WeeklyReserveHold | undefined {
+  const newest = currentUsageReading(readings, now)
   if (!newest || typeof newest.utilization !== "number") return undefined
   const limit = 1 - reservePercent / 100
   if (newest.utilization < limit) return undefined

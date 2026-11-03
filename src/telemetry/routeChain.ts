@@ -39,7 +39,9 @@ function toHop(metric: RequestMetric): RouteHop {
  * its head, and those are different answers to "why this account".
  */
 function collapsedRouteKind(hopKind: RouteKind | undefined): RouteKind {
-  return hopKind === "active+priority-hop" ? "active+priority" : "priority"
+  if (hopKind === "active+priority-hop") return "active+priority"
+  if (hopKind === "balanced-hop") return "balanced"
+  return "priority"
 }
 
 /**

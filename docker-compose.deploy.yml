@@ -1,0 +1,63 @@
+# Pull-and-run compose for a host that does NOT have this repository checked
+# out: it only ever pulls a published image, so the host needs Docker and this
+# one file. To build from source instead, use docker-compose.yml.
+#
+# In the same directory, a .env with at least:
+#   MERIDIAN_API_KEY=<openssl rand -hex 32>
+#   MERIDIAN_IMAGE=<registry>/meridian:<tag>
+#   MERIDIAN_BIND_HOST=<private IP of this host>
+#
+#   docker compose -f docker-compose.deploy.yml up -d
+#
+# Then open http://<bind-host>:3456/, sign in with the API key, and add the
+# Claude accounts on the Profiles page ("Add a profile"). A browser that is not
+# on this host finishes each sign-in by pasting the code Claude shows.
+
+# Declared for Compose v1 (the `docker-compose` binary from Ubuntu's docker.io
+# package), which otherwise reads this as the legacy file format and rejects
+# `services:`. Compose v2 ignores it apart from a deprecation warning.
+version: "3.8"
+
+services:
+  meridian:
+    image: ${MERIDIAN_IMAGE:?set MERIDIAN_IMAGE to a published Meridian image}
+    container_name: meridian
+    ports:
+      # Defaults to loopback: safe, but only this host can reach it. To let
+      # another machine call the proxy, set MERIDIAN_BIND_HOST to this host's
+      # private address and put a firewall or security group in front. 0.0.0.0
+      # publishes on every interface, including a public one if the host has
+      # it — anyone who reaches the port and holds the key spends every
+      # account's subscription.
+      - "${MERIDIAN_BIND_HOST:-127.0.0.1}:${MERIDIAN_PUBLISH_PORT:-3456}:3456"
+    environment:
+      # Required. Guards the API, the web UI and every account change.
+      MERIDIAN_API_KEY: ${MERIDIAN_API_KEY:?set MERIDIAN_API_KEY}
+      # Stable across restarts and unique to this container: it owns the
+      # session locks in the volumes below.
+      MERIDIAN_HOST_ID: ${MERIDIAN_HOST_ID:-meridian-deploy}
+      # active (default) | sticky | priority | active+priority | balanced.
+      # balanced spreads new conversations over the accounts with the least
+      # work in flight; see docs/profiles.md.
+      MERIDIAN_ROUTING: ${MERIDIAN_ROUTING:-balanced}
+      # 1 when several tenants share this instance: every request must name
+      # its profile in x-meridian-profile, and an unknown or disabled one is
+      # refused instead of served by another account.
+      MERIDIAN_REQUIRE_PROFILE: ${MERIDIAN_REQUIRE_PROFILE:-0}
+    volumes:
+      # Read-write and owned by exactly this container. Claude refresh tokens
+      # rotate when used, so two instances refreshing copies of one login
+      # eventually sign each other out for good.
+      #   claude-home:     default Claude credentials and SDK transcripts
+      #   meridian-config: profiles.json, each profile's credentials, settings
+      #   meridian-cache:  session mappings
+      - claude-home:/home/claude/.claude
+      - meridian-config:/home/claude/.config/meridian
+      - meridian-cache:/home/claude/.cache/meridian
+    restart: unless-stopped
+    # The image already declares a HEALTHCHECK; it is not repeated here.
+
+volumes:
+  claude-home:
+  meridian-config:
+  meridian-cache:
